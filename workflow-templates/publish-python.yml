@@ -1,0 +1,278 @@
+# Python Publishing Workflow Template
+# For SuperInstance Python repositories
+#
+# Features:
+# - Automatic PyPI publishing on GitHub releases
+# - Universal and platform-specific wheel building
+# - Source distribution building
+#
+# Required Secrets:
+# - PYPI_API_TOKEN: API token for PyPI publishing
+# - TEST_PYPI_API_TOKEN: (Optional) API token for TestPyPI
+
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to release (e.g., v1.0.0)'
+        required: true
+        type: string
+      test_pypi:
+        description: 'Publish to TestPyPI instead of PyPI'
+        required: false
+        type: boolean
+        default: false
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  PYTHON_DEFAULT_VERSION: '3.11'
+
+jobs:
+  validate:
+    name: Validate Release
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.parse_version.outputs.version }}
+      test_pypi: ${{ steps.test_pypi.outputs.test_pypi }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Parse version
+        id: parse_version
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            VERSION="${{ github.event.inputs.version }}"
+          else
+            VERSION=${GITHUB_REF#refs/tags/}
+          fi
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Releasing version: $VERSION"
+
+      - name: Set test PyPI flag
+        id: test_pypi
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "test_pypi=${{ github.event.inputs.test_pypi }}" >> $GITHUB_OUTPUT
+          else
+            echo "test_pypi=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Validate version format
+        run: |
+          VERSION="${{ steps.parse_version.outputs.version }}"
+          if [[ ! $VERSION =~ ^v[0-9]+\.[0-9]+\.[0-9]+[a-z0-9.]*$ ]]; then
+            echo "::error::Invalid version format: $VERSION"
+            exit 1
+          fi
+
+  build:
+    name: Build Package
+    needs: validate
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        python-version: ['3.9', '3.10', '3.11', '3.12']
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install build tools
+        run: |
+          python -m pip install --upgrade pip
+          pip install build wheel
+
+      - name: Build source distribution
+        if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.11'
+        run: |
+          python -m build --sdist
+
+      - name: Build wheel
+        run: |
+          python -m build --wheel --outdir dist/
+
+      - name: Check package with twine
+        run: |
+          pip install twine
+          twine check dist/*
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.os }}-${{ matrix.python-version }}
+          path: dist/
+
+  test-package:
+    name: Test Installed Package
+    needs: validate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_DEFAULT_VERSION }}
+
+      - name: Install build tools
+        run: |
+          python -m pip install --upgrade pip
+          pip install build wheel
+
+      - name: Build package
+        run: |
+          python -m build
+
+      - name: Create test virtual environment
+        run: |
+          python -m venv test_env
+
+      - name: Install package in test environment
+        run: |
+          ./test_env/bin/pip install dist/*.whl
+
+      - name: Test import
+        run: |
+          ./test_env/bin/python -c "import PACKAGE_NAME; print(PACKAGE_NAME.__version__)"
+
+  publish-pypi:
+    name: Publish to PyPI
+    needs: [validate, build, test-package]
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/PACKAGE_NAME
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_DEFAULT_VERSION }}
+
+      - name: Install build tools
+        run: |
+          python -m pip install --upgrade pip
+          pip install build twine
+
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*
+          path: all-dist/
+          merge-multiple: true
+
+      - name: Organize distributions
+        run: |
+          mkdir -p dist/
+          find all-dist/ -name "*.whl" -exec cp {} dist/ \;
+          find all-dist/ -name "*.tar.gz" -exec cp {} dist/ \;
+          ls -lah dist/
+
+      - name: Publish to TestPyPI
+        if: needs.validate.outputs.test_pypi == 'true'
+        env:
+          TWINE_USERNAME: __token__
+          TWINE_PASSWORD: ${{ secrets.TEST_PYPI_API_TOKEN }}
+        run: |
+          pip install twine
+          twine upload --repository testpypi dist/*
+
+      - name: Publish to PyPI
+        if: needs.validate.outputs.test_pypi != 'true'
+        env:
+          TWINE_USERNAME: __token__
+          TWINE_PASSWORD: ${{ secrets.PYPI_API_TOKEN }}
+        run: |
+          pip install twine
+          twine upload dist/*
+
+  create-release:
+    name: Create GitHub Release
+    needs: [validate, publish-pypi]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Generate release notes
+        id: release_notes
+        run: |
+          cat > release_notes.md << 'EOF'
+          ## ${{ needs.validate.outputs.version }}
+
+          ### Installation
+
+          ```bash
+          pip install package-name
+          ```
+
+          ```bash
+          python -m pip install --upgrade package-name
+          ```
+
+          ### What's Changed
+
+          See [CHANGELOG.md](https://github.com/SuperInstance/REPO_NAME/blob/main/CHANGELOG.md) for detailed changes.
+          EOF
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ needs.validate.outputs.version }}
+          name: Release ${{ needs.validate.outputs.version }}
+          body_path: release_notes.md
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  release-summary:
+    name: Release Summary
+    needs: [validate, create-release, publish-pypi]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check all release jobs
+        run: |
+          echo "## Release Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- Version: ${{ needs.validate.outputs.version }}" >> $GITHUB_STEP_SUMMARY
+          echo "- GitHub Release: ${{ needs.create-release.result }}" >> $GITHUB_STEP_SUMMARY
+          pypi_url="https://pypi.org/p/PACKAGE_NAME"
+          if [ "${{ needs.validate.outputs.test_pypi }}" = "true" ]; then
+            pypi_url="https://test.pypi.org/p/PACKAGE_NAME"
+          fi
+          echo "- PyPI Publish: ${{ needs.publish-pypi.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "- PyPI URL: $pypi_url" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          if [ "${{ needs.create-release.result }}" != "success" ] || \
+             [ "${{ needs.publish-pypi.result }}" != "success" ]; then
+            echo "::warning::Some release jobs failed. Please review."
+            exit 1
+          fi
+
+          echo "::notice::Release ${{ needs.validate.outputs.version }} completed successfully!"

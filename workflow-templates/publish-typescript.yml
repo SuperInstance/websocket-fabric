@@ -1,0 +1,234 @@
+# TypeScript/Node.js Publishing Workflow Template
+# For SuperInstance TypeScript/JavaScript repositories
+#
+# Features:
+# - Automatic npm publishing on GitHub releases
+# - Semantic versioning support
+# - Provenance attestation
+#
+# Required Secrets:
+# - NPM_TOKEN: Automation token for npm publishing
+# - GITHUB_TOKEN: Automatically provided by GitHub Actions
+
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to release (e.g., v1.0.0)'
+        required: true
+        type: string
+      dry_run:
+        description: 'Dry run (skip publish)'
+        required: false
+        type: boolean
+        default: false
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    name: Validate Release
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.parse_version.outputs.version }}
+      dry_run: ${{ steps.dry_run.outputs.dry_run }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Parse version
+        id: parse_version
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            VERSION="${{ github.event.inputs.version }}"
+          else
+            VERSION=${GITHUB_REF#refs/tags/}
+          fi
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Releasing version: $VERSION"
+
+      - name: Set dry run
+        id: dry_run
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "dry_run=${{ github.event.inputs.dry_run }}" >> $GITHUB_OUTPUT
+          else
+            echo "dry_run=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Validate version format
+        run: |
+          VERSION="${{ steps.parse_version.outputs.version }}"
+          if [[ ! $VERSION =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[a-z]+\.[0-9]+)?$ ]]; then
+            echo "::error::Invalid version format: $VERSION (expected v*.*.*)"
+            exit 1
+          fi
+
+  build:
+    name: Build Package
+    needs: validate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 8
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'pnpm'
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Run tests
+        run: pnpm test
+
+      - name: Build package
+        run: pnpm run build
+
+      - name: Check package exports
+        run: |
+          if [ ! -f "dist/index.js" ]; then
+            echo "::error::Build output not found"
+            exit 1
+          fi
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: package-dist
+          path: dist/
+
+  publish-npm:
+    name: Publish to npm
+    needs: [validate, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 8
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'pnpm'
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: package-dist
+          path: dist/
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Create npm package
+        run: |
+          pnpm pack
+          ls -lh *.tgz
+
+      - name: Skip publish (dry run)
+        if: needs.validate.outputs.dry_run == 'true'
+        run: |
+          echo "::notice::Dry run - skipping npm publish"
+
+      - name: Publish to npm
+        if: needs.validate.outputs.dry_run != 'true'
+        run: |
+          echo "//registry.npmjs.org/:_authToken=\${NPM_TOKEN}" > .npmrc
+          npm publish --provenance --access public
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+  create-release:
+    name: Create GitHub Release
+    needs: [validate, build, publish-npm]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Generate release notes
+        id: release_notes
+        run: |
+          cat > release_notes.md << 'EOF'
+          ## ${{ needs.validate.outputs.version }}
+
+          ### Installation
+
+          ```bash
+          npm install @superinstance/PACKAGE_NAME
+          ```
+
+          ```bash
+          pnpm add @superinstance/PACKAGE_NAME
+          ```
+
+          ```bash
+          yarn add @superinstance/PACKAGE_NAME
+          ```
+
+          ### What's Changed
+
+          See [CHANGELOG.md](https://github.com/SuperInstance/REPO_NAME/blob/main/CHANGELOG.md) for detailed changes.
+          EOF
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ needs.validate.outputs.version }}
+          name: Release ${{ needs.validate.outputs.version }}
+          body_path: release_notes.md
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  release-summary:
+    name: Release Summary
+    needs: [validate, create-release, publish-npm]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check all release jobs
+        run: |
+          echo "## Release Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- Version: ${{ needs.validate.outputs.version }}" >> $GITHUB_STEP_SUMMARY
+          echo "- GitHub Release: ${{ needs.create-release.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "- npm Publish: ${{ needs.publish-npm.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          if [ "${{ needs.create-release.result }}" != "success" ] || \
+             [ "${{ needs.publish-npm.result }}" != "success" ]; then
+            echo "::warning::Some release jobs failed. Please review."
+            exit 1
+          fi
+
+          echo "::notice::Release ${{ needs.validate.outputs.version }} completed successfully!"
