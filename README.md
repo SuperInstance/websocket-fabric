@@ -17,6 +17,75 @@
 - **Type-safe**: Full Rust type safety with serde JSON support
 - **Async**: Built on Tokio for efficient async I/O
 
+## Architecture
+
+websocket-fabric is built as a layered library on top of `tokio-tungstenite`, structured into six concentric layers that handle different aspects of real-time WebSocket communication. The design prioritizes composability: each module can be used independently or composed together through the unified `ClientConfig` and `ServerConfig` builders.
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                     Application Layer                            │
+│          WebSocketClient / WebSocketServer public API             │
+├─────────────────────────────────────────────────────────────────┤
+│                     Connection Pool                              │
+│   PoolConfig → ConnectionPool → PooledClient → PoolStats        │
+├────────────────┬───────────────┬───────────────┬─────────────────┤
+│  Reconnect     │  Backpressure  │   Heartbeat    │   Rate Limit    │
+│  (exponential  │  (threshold-    │  (ping/pong   │   (token/       │
+│   backoff)     │   based flow    │   keepalive)  │    sliding)     │
+├────────────────┴───────────────┴───────────────┴─────────────────┤
+│                  Subprotocol & Headers                           │
+│   SubprotocolNegotiator · HeaderMap · RFC 6455 Section 1.9       │
+├─────────────────────────────────────────────────────────────────┤
+│                Compression & Fragmentation                       │
+│   Compressor/Decompressor (per-message deflate)                  │
+│   Fragmenter/Reassembler (RFC 6455 fragmentation)                │
+├─────────────────────────────────────────────────────────────────┤
+│                  Core Transport Layer                             │
+│   Message framing · bytes::Bytes zero-copy · tokio channels     │
+├─────────────────────────────────────────────────────────────────┤
+│                     Metrics & Observability                      │
+│   MetricsCollector · latency percentiles · tracing spans        │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### Module Organization
+
+The library exposes 16 modules, each with a single responsibility:
+
+| Module | Purpose |
+|--------|---------|
+| `client` | `WebSocketClient` — async client with send/receive/close |
+| `server` | `WebSocketServer` / `ConnectedClient` — async server with accept loop |
+| `message` | `Message`, `MessageType`, `Frame` — type-safe message wrappers around `bytes::Bytes` |
+| `config` | `ClientConfig`, `ServerConfig` — builder-pattern configuration |
+| `reconnect` | Exponential backoff with configurable jitter and multipliers |
+| `backpressure` | Threshold-based flow control using bounded tokio channels |
+| `heartbeat` | Periodic ping/pong keepalive with configurable timeouts |
+| `metrics` | `MetricsCollector` — atomic counters for throughput and latency percentiles |
+| `pool` | `ConnectionPool` — reusable connection pool with health checks |
+| `compression` | Per-message DEFLATE via `flate2` (compress on send, decompress on receive) |
+| `fragmentation` | Outbound fragmentation and inbound reassembly per RFC 6455 §5.4 |
+| `subprotocol` | `SubprotocolList` / `SubprotocolNegotiator` — RFC 6455 §1.9 negotiation |
+| `headers` | `HeaderMap` — custom HTTP headers during the WebSocket handshake |
+| `ratelimit` | `RateLimiter` / `GlobalRateLimiter` — token-bucket rate limiting |
+| `error` | `Error` enum with `thiserror` derive; covers 9 error categories |
+
+### Data Flow
+
+Messages flow through the library as `bytes::Bytes` — never copied, only cloned when absolutely necessary. The zero-copy path is:
+
+```
+Application Message (serde) → serialize → bytes::Bytes → WebSocket frame → tokio-tungstenite
+                                                                     ↓
+tokio-tungstenite → WebSocket frame → bytes::Bytes → deserialize → Application Message
+```
+
+The `Message` enum wraps `Text(String)` and `Binary(Bytes)` variants, while `Frame` exposes the raw WebSocket opcode and payload for advanced use cases. Compression is applied transparently when enabled via `CompressionConfig`, reducing bandwidth by up to 85% for JSON payloads.
+
+### Fleet Integration
+
+websocket-fabric serves as the transport layer for the Cocapn Fleet, powering inter-agent communication channels. Agents use the connection pool to maintain persistent WebSocket links with the fleet broker, while subprotocol negotiation enables protocol versioning between fleet members.
+
 ## Performance
 
 - **Latency**: P50 <100µs, P95 <500µs
@@ -244,3 +313,7 @@ Built with:
 - [tokio](https://tokio.rs/) - Async runtime
 - [bytes](https://github.com/tokio-rs/bytes) - Zero-copy byte management
 - [thiserror](https://github.com/dtolnay/thiserror) - Error handling
+
+---
+
+<img src="callsign1.jpg" width="128" alt="callsign">
